@@ -122,12 +122,18 @@ class TestDashboardLifecycle:
         assert "config" in get_data
         assert "views" in get_data["config"]
 
+        # Replacing an existing dashboard's config requires the config_hash
+        # from ha_config_get_dashboard (optimistic locking, #1410).
+        config_hash = get_data["config_hash"]
+        assert config_hash
+
         # 4. Update config (add another card)
         logger.info("Updating dashboard config...")
         update_data = await mcp.call_tool_success(
             "ha_config_set_dashboard",
             {
                 "url_path": "test-e2e-dashboard",
+                "config_hash": config_hash,
                 "config": {
                     "views": [
                         {
@@ -155,7 +161,8 @@ class TestDashboardLifecycle:
         # 6. Delete dashboard
         logger.info("Deleting test dashboard...")
         delete_data = await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"url_path": dashboard_id}
+            "ha_config_delete_dashboard",
+            {"url_path": dashboard_id, "confirm": True},
         )
         assert delete_data["success"] is True
 
@@ -199,7 +206,7 @@ class TestDashboardLifecycle:
 
         # Cleanup
         await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"url_path": dashboard_id}
+            "ha_config_delete_dashboard", {"url_path": dashboard_id, "confirm": True}
         )
 
         logger.info("Strategy-based dashboard test completed successfully")
@@ -269,7 +276,7 @@ class TestDashboardLifecycle:
 
         # Cleanup
         await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"url_path": dashboard_id}
+            "ha_config_delete_dashboard", {"url_path": dashboard_id, "confirm": True}
         )
 
         logger.info("Partial metadata update test completed successfully")
@@ -299,7 +306,7 @@ class TestDashboardLifecycle:
 
         # Cleanup
         await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"url_path": dashboard_id}
+            "ha_config_delete_dashboard", {"url_path": dashboard_id, "confirm": True}
         )
 
         logger.info("Dashboard without config test completed successfully")
@@ -327,7 +334,7 @@ class TestDashboardLifecycle:
 
         # Cleanup
         await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"url_path": dashboard_id}
+            "ha_config_delete_dashboard", {"url_path": dashboard_id, "confirm": True}
         )
 
         logger.info("Metadata update via set_dashboard test completed successfully")
@@ -359,7 +366,7 @@ class TestDashboardErrorHandling:
         with pytest.raises(ToolError) as exc_info:
             await mcp_client.call_tool(
                 "ha_config_delete_dashboard",
-                {"url_path": "nonexistent-dashboard-67890"},
+                {"url_path": "nonexistent-dashboard-67890", "confirm": True},
             )
 
         data = json.loads(str(exc_info.value))
@@ -382,7 +389,8 @@ class TestDashboardIdentifierResolution:
         )
 
         delete_data = await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"url_path": "test-981-delete-by-url"}
+            "ha_config_delete_dashboard",
+            {"url_path": "test-981-delete-by-url", "confirm": True},
         )
         assert delete_data["success"] is True
         assert delete_data["url_path"] == "test-981-delete-by-url"
@@ -424,7 +432,8 @@ class TestDashboardIdentifierResolution:
             assert get_data["config"]["views"][0]["cards"][0]["content"] == "hi"
         finally:
             await mcp.call_tool_success(
-                "ha_config_delete_dashboard", {"url_path": "test-981-get-by-id"}
+                "ha_config_delete_dashboard",
+                {"url_path": "test-981-get-by-id", "confirm": True},
             )
 
     async def test_set_via_internal_id_pre_resolves(self, mcp_client):
@@ -449,12 +458,20 @@ class TestDashboardIdentifierResolution:
         assert internal_id == "test_981_set_by_id"
 
         try:
+            # Replacing an existing dashboard's config is hash-gated, so
+            # capture the current config_hash before the write.
+            pre_update_get = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": "test-981-set-by-id"}
+            )
+            config_hash = pre_update_get["config_hash"]
+
             # Update via internal id — pre-resolver replaces it with url_path
             # so the hyphen validation passes.
             update_data = await mcp.call_tool_success(
                 "ha_config_set_dashboard",
                 {
                     "url_path": internal_id,
+                    "config_hash": config_hash,
                     "config": {
                         "views": [{"cards": [{"type": "markdown", "content": "v2"}]}]
                     },
@@ -470,7 +487,8 @@ class TestDashboardIdentifierResolution:
             assert get_data["config"]["views"][0]["cards"][0]["content"] == "v2"
         finally:
             await mcp.call_tool_success(
-                "ha_config_delete_dashboard", {"url_path": "test-981-set-by-id"}
+                "ha_config_delete_dashboard",
+                {"url_path": "test-981-set-by-id", "confirm": True},
             )
 
     async def test_mixed_identifier_optimistic_locking(self, mcp_client):
@@ -532,7 +550,8 @@ class TestDashboardIdentifierResolution:
             )
         finally:
             await mcp.call_tool_success(
-                "ha_config_delete_dashboard", {"url_path": "test-981-mixed-hash"}
+                "ha_config_delete_dashboard",
+                {"url_path": "test-981-mixed-hash", "confirm": True},
             )
 
 
@@ -598,7 +617,7 @@ class TestFindCard:
         finally:
             await mcp.call_tool_success(
                 "ha_config_delete_dashboard",
-                {"url_path": "test-find-entity"},
+                {"url_path": "test-find-entity", "confirm": True},
             )
 
     async def test_find_card_by_type(self, mcp_client):
@@ -645,7 +664,7 @@ class TestFindCard:
         finally:
             await mcp.call_tool_success(
                 "ha_config_delete_dashboard",
-                {"url_path": "test-find-type"},
+                {"url_path": "test-find-type", "confirm": True},
             )
 
     async def test_find_nested_card_python_path_round_trip(self, mcp_client):
@@ -730,5 +749,5 @@ class TestFindCard:
         finally:
             await mcp.call_tool_success(
                 "ha_config_delete_dashboard",
-                {"url_path": "test-find-roundtrip"},
+                {"url_path": "test-find-roundtrip", "confirm": True},
             )

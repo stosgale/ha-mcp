@@ -293,11 +293,13 @@ async def test_python_transform_hash_conflict(mcp_client, ha_client):
     )
     config_hash = get_result["config_hash"]
 
-    # Modify dashboard directly
+    # Modify dashboard directly — replace-mode set is hash-gated, so pass
+    # the still-current hash (no write has happened since the get above).
     await mcp.call_tool_success(
         "ha_config_set_dashboard",
         {
             "url_path": "test-python-conflict",
+            "config_hash": config_hash,
             "config": {"views": [{"cards": [{"type": "button"}]}]},
         },
     )
@@ -614,5 +616,5 @@ async def test_python_transform_returns_authoritative_post_save_hash(
         assert chain_result["action"] == "python_transform"
     finally:
         await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"url_path": url_path}
+            "ha_config_delete_dashboard", {"url_path": url_path, "confirm": True}
         )
