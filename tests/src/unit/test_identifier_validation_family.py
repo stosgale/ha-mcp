@@ -765,7 +765,7 @@ class TestDashboardsIdentifierValidation:
         ha_config_delete_dashboard = captured["ha_config_delete_dashboard"]
 
         with pytest.raises(ToolError) as excinfo:
-            await ha_config_delete_dashboard(url_path=bad)
+            await ha_config_delete_dashboard(url_path=bad, confirm=True)
         _assert_invalid_param(excinfo)
         assert '"parameter": "url_path"' in str(excinfo.value), str(excinfo.value)
         mock_ws_client.send_websocket_message.assert_not_called()

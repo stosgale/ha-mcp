@@ -303,7 +303,7 @@ class TestDeleteDashboardNotFoundShape:
         }
 
         with pytest.raises(ToolError) as exc_info:
-            await delete_tool(url_path="ghost-dash")
+            await delete_tool(url_path="ghost-dash", confirm=True)
 
         body = json.loads(str(exc_info.value))
 
@@ -341,7 +341,7 @@ class TestDeleteDashboardNotFoundShape:
             {"success": False, "error": {"message": "Dashboard not found"}},
         ]
 
-        result = await delete_tool(url_path="stale-dash")
+        result = await delete_tool(url_path="stale-dash", confirm=True)
 
         assert result["success"] is True
         assert result["action"] == "delete"

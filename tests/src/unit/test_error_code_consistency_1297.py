@@ -443,7 +443,7 @@ class TestDeleteDashboardNotFoundSurfacesAvailableIds:
         }
 
         with pytest.raises(ToolError) as exc_info:
-            await delete_tool(url_path="ghost-dash")
+            await delete_tool(url_path="ghost-dash", confirm=True)
 
         error_data = json.loads(str(exc_info.value))
         assert error_data["error"]["code"] == "RESOURCE_NOT_FOUND"
@@ -476,7 +476,7 @@ class TestDeleteDashboardNotFoundSurfacesAvailableIds:
         mock_client.send_websocket_message.return_value = "garbage"
 
         with pytest.raises(ToolError) as exc_info:
-            await delete_tool(url_path="ghost-dash")
+            await delete_tool(url_path="ghost-dash", confirm=True)
 
         error_data = json.loads(str(exc_info.value))
         assert error_data["error"]["code"] == "RESOURCE_NOT_FOUND"

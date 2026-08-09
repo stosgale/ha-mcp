@@ -3858,6 +3858,34 @@ class DashboardConfigTools:
             summary = f"Would update metadata for dashboard '{url_path}'"
         return self._build_dry_run_result(url_path, summary, preview_config)
 
+    async def _preview_delete_dashboard(self, url_path: str) -> dict[str, Any]:
+        """Build a dry-run preview for dashboard deletion (ZERO writes).
+
+        Short-circuits BEFORE the confirm gate and the delete call: no
+        ``lovelace/dashboards/delete`` is sent, no confirm is required
+        (nothing is deleted), and no backup snapshot is taken
+        (``_skip_dry_run`` on the ``@with_auto_backup`` decorator). A
+        dashboard missing from the registry is reported as not found,
+        mirroring the real delete path.
+        """
+        resolved, _ = await _resolve_dashboard(self._client, url_path)
+        if resolved is None:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    f"Dashboard '{url_path}' not found",
+                    details=f"No dashboard found with URL path or internal ID '{url_path}'.",
+                    suggestions=[
+                        "Use ha_config_get_dashboard(list_only=True) to see available dashboards",
+                        "YAML-mode and default dashboards are not deletable via this tool",
+                    ],
+                    context={"action": "delete", "url_path": url_path},
+                )
+            )
+        return self._build_dry_run_result(
+            url_path, f"Would delete dashboard '{url_path}'", {}
+        )
+
     @tool(
         name="ha_config_delete_dashboard",
         tags={"Dashboards"},
@@ -3867,7 +3895,7 @@ class DashboardConfigTools:
             "title": "Delete Dashboard",
         },
     )
-    @with_auto_backup(domain="dashboard", id_param="url_path")
+    @with_auto_backup(domain="dashboard", id_param="url_path", skip_fn=_skip_dry_run)
     @log_tool_usage
     async def ha_config_delete_dashboard(
         self,
@@ -3878,6 +3906,24 @@ class DashboardConfigTools:
                 "(e.g., 'my-dashboard' or 'my_dashboard'). Both forms are accepted."
             ),
         ],
+        confirm: Annotated[
+            bool,
+            Field(
+                description="REQUIRED for actual deletion: pass confirm=True to "
+                "permanently delete the dashboard. Deletion is REFUSED without "
+                "it (a safety measure against accidental destruction). Not "
+                "required for dry_run=True previews, which delete nothing."
+            ),
+        ] = False,
+        dry_run: Annotated[
+            bool,
+            Field(
+                description="If true, preview the would-be deletion WITHOUT "
+                'deleting: returns {"dry_run": true, "url_path", "summary"} '
+                "describing the deletion that would happen. Performs ZERO "
+                "writes and creates no backup snapshot."
+            ),
+        ] = False,
     ) -> dict[str, Any]:
         """
         Delete a storage-mode dashboard completely.
@@ -3885,12 +3931,22 @@ class DashboardConfigTools:
         WARNING: This permanently deletes the dashboard and all its configuration.
         Cannot be undone. Does not work on YAML-mode dashboards.
 
+        REQUIRED: ``confirm=True`` must be passed to actually delete — the tool
+        refuses with ``VALIDATION_INVALID_PARAMETER`` ("confirm=True is required
+        to delete a dashboard") otherwise, as a safety measure against
+        accidental destruction.
+
+        ``dry_run=True`` previews the deletion without executing it: the tool
+        resolves the dashboard and returns the would-be summary, performing
+        ZERO writes (no delete call, no backup snapshot).
+
         Accepts either the URL path or the internal dashboard ID. HA internal IDs
         may differ from url_path (e.g. hyphens → underscores); the tool resolves
         either form to the actual registry ID before deletion.
 
         EXAMPLES:
-        - Delete dashboard: ha_config_delete_dashboard("mobile-dashboard")
+        - Delete dashboard: ha_config_delete_dashboard("mobile-dashboard", confirm=True)
+        - Preview deletion: ha_config_delete_dashboard("mobile-dashboard", dry_run=True)
 
         Note: The default dashboard cannot be deleted via this method.
         """
@@ -3909,6 +3965,26 @@ class DashboardConfigTools:
                 ],
                 context={"action": "delete"},
             )
+            if dry_run:
+                return await self._preview_delete_dashboard(url_path)
+            if not confirm:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        "confirm=True is required to delete a dashboard",
+                        details=(
+                            "ha_config_delete_dashboard permanently removes the "
+                            "dashboard; deletion is refused without explicit "
+                            "confirmation."
+                        ),
+                        suggestions=[
+                            f"Call ha_config_delete_dashboard(url_path={json.dumps(url_path)}, confirm=True) to proceed",
+                            "Use dry_run=True to preview the deletion without deleting anything",
+                            "Use ha_config_get_dashboard(list_only=True) to list dashboards before deleting",
+                        ],
+                        context={"action": "delete", "url_path": url_path},
+                    )
+                )
             resolved, dashboards = await _resolve_dashboard(self._client, url_path)
             if resolved is None:
                 available_ids = [
