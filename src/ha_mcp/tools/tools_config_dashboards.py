@@ -4279,6 +4279,161 @@ class DashboardConfigTools:
         cards.insert(insert_at, card)
         return f"Inserted new card at index {insert_at}"
 
+    @tool(
+        name="ha_config_remove_card",
+        tags={"Dashboards"},
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+            "title": "Remove Dashboard Card",
+        },
+    )
+    @with_auto_backup(domain="dashboard", id_param="url_path", skip_fn=_skip_dry_run)
+    @log_tool_usage
+    async def ha_config_remove_card(
+        self,
+        url_path: Annotated[
+            str,
+            Field(description="Dashboard URL path (e.g., 'my-dashboard')."),
+        ],
+        view: Annotated[
+            str,
+            Field(
+                description="Target view: a numeric index (as string), or a "
+                "matching view path or title."
+            ),
+        ],
+        card_index: Annotated[
+            int,
+            Field(description="Index of the card to remove."),
+        ],
+        section: Annotated[
+            int | None,
+            Field(
+                description="Section index within a 'sections'-type view. "
+                "Required when the target view is a sections view; omit for "
+                "flat-layout views."
+            ),
+        ] = None,
+        dry_run: Annotated[
+            bool,
+            Field(
+                description="If true, preview the would-be removal WITHOUT "
+                'saving: returns {"dry_run": true, "url_path", "summary", '
+                '"config"}. Performs ZERO writes and creates no backup snapshot.'
+            ),
+        ] = False,
+    ) -> dict[str, Any]:
+        """Remove a card from a dashboard view."""
+        config, _ = await _get_dashboard_config_internal(self._client, url_path)
+        await self._assert_storage_mode_dashboard(url_path)
+
+        target_view = self._resolve_view(config, view)
+        if section is not None:
+            target_section = self._resolve_section(target_view, section)
+            cards = target_section.get("cards", [])
+        else:
+            cards = target_view.get("cards", [])
+        if not isinstance(cards, list):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "Card container is not a list",
+                    suggestions=[
+                        "Pass a view or section whose 'cards' value is a list",
+                        "Use ha_config_get_dashboard() to inspect the config",
+                    ],
+                    context={"action": "remove_card", "url_path": url_path},
+                )
+            )
+        if card_index < 0 or card_index >= len(cards):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    f"card_index {card_index} out of range ({len(cards)} cards)",
+                    context={
+                        "action": "remove_card",
+                        "url_path": url_path,
+                        "card_index": card_index,
+                        "card_count": len(cards),
+                    },
+                )
+            )
+
+        removed = cards.pop(card_index)
+        card_type = (
+            removed.get("type", "unknown") if isinstance(removed, dict) else "unknown"
+        )
+        summary = f"Removed card at index {card_index} (type={card_type})"
+
+        if dry_run:
+            return self._build_dry_run_result(url_path, summary, config)
+
+        await self._save_dashboard_config(url_path, config)
+        return {"success": True, "url_path": url_path, "summary": summary}
+
+    @tool(
+        name="ha_config_list_view_sections",
+        tags={"Dashboards"},
+        annotations={
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+            "title": "List View Sections",
+        },
+    )
+    @log_tool_usage
+    async def ha_config_list_view_sections(
+        self,
+        url_path: Annotated[
+            str,
+            Field(description="Dashboard URL path (e.g., 'my-dashboard')."),
+        ],
+        view: Annotated[
+            str,
+            Field(
+                description="Target view: a numeric index (as string), or a "
+                "matching view path or title."
+            ),
+        ],
+    ) -> dict[str, Any]:
+        """List sections of a 'sections'-type dashboard view."""
+        config, _ = await _get_dashboard_config_internal(self._client, url_path)
+
+        target_view = self._resolve_view(config, view)
+        sections = target_view.get("sections")
+        if not isinstance(sections, list):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "View is not a 'sections'-type view — no 'sections' key present",
+                    suggestions=[
+                        "Use this tool only on 'sections'-type views",
+                        "Flat/masonry views keep their cards in the view's "
+                        "'cards' list instead",
+                    ],
+                    context={
+                        "view": target_view.get("path") or target_view.get("title"),
+                    },
+                )
+            )
+        return {
+            "success": True,
+            "url_path": url_path,
+            "sections": [
+                {
+                    "index": i,
+                    "title": s.get("title"),
+                    "heading": s.get("heading"),
+                    "card_count": len(s.get("cards", [])),
+                }
+                for i, s in enumerate(sections)
+                if isinstance(s, dict)
+            ],
+        }
+
 
 # =========================================================================
 # Dashboard Resource Management Tools
