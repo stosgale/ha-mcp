@@ -117,6 +117,17 @@ def _attach_dashboard_skill(response: dict[str, Any], MandatoryBPS: bool) -> Non
     )
 
 
+def _skip_dry_run(kwargs: dict[str, Any]) -> bool:
+    """True when a write tool call is a ``dry_run`` preview (no snapshot needed).
+
+    Wired as ``skip_fn`` on the write tools' ``@with_auto_backup`` decorators so
+    a dry-run preview produces zero backup snapshots (and is never refused by
+    the mandatory gate): the call writes nothing, so there is nothing to
+    protect.
+    """
+    return bool(kwargs.get("dry_run", False))
+
+
 async def _get_dashboard_config_internal(
     client: Any, url_path: str | None
 ) -> tuple[dict[str, Any], str]:
@@ -1700,6 +1711,156 @@ class DashboardConfigTools:
 
     def __init__(self, client: Any) -> None:
         self._client = client
+
+    def _build_dry_run_result(
+        self, url_path: str, summary: str, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build the dry-run preview result shape (performs ZERO writes).
+
+        Returned by the write tools when ``dry_run=True`` so a caller can
+        preview the exact mutation — including the resulting config — before
+        committing. The shape mirrors the live result minus the
+        ``success``/``backup_id`` fields, with ``dry_run: True`` as the marker.
+        """
+        return {
+            "dry_run": True,
+            "url_path": url_path,
+            "summary": summary,
+            "config": config,
+        }
+
+    async def _assert_storage_mode_dashboard(self, url_path: str) -> None:
+        """Fail-closed storage-mode guard for dashboard writes.
+
+        Raises a clear ``ToolError`` for YAML-mode or unknown-mode dashboards.
+        The default dashboard (``"default"``/``"lovelace"``) is special-cased:
+        it is never listed by ``lovelace/dashboards/list``, so
+        ``_dashboard_is_storage_mode`` (fail-closed for it) must NOT be used
+        directly. Instead its mode is resolved from the fetched config row via
+        the read path (``_get_dashboard_config_internal`` / ``lovelace/config``)
+        — a dict row proves a storage-backed, writable dashboard, and a
+        non-dict body (HA serves YAML-mode configs as ``None``) is refused.
+        """
+        if url_path in ("default", "lovelace"):
+            try:
+                config, _config_hash = await _get_dashboard_config_internal(
+                    self._client, url_path
+                )
+            except ToolError:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        f"Default dashboard '{url_path}' is not writable: "
+                        "its config could not be read (YAML-mode or unavailable)",
+                        context={"action": "storage-guard", "url_path": url_path},
+                    )
+                )
+            if not isinstance(config, dict):
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        f"Default dashboard '{url_path}' is not writable: "
+                        "config row is not a dict (YAML-mode)",
+                        context={"action": "storage-guard", "url_path": url_path},
+                    )
+                )
+            return
+        if not await self._dashboard_is_storage_mode(url_path):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    f"Dashboard '{url_path}' is not writable via this tool: "
+                    "only storage-mode dashboards are supported, and the "
+                    "dashboard's mode is YAML or unknown",
+                    suggestions=[
+                        "Edit YAML-mode dashboards in their own .yaml file",
+                        "Use ha_config_get_dashboard(list_only=True) to list "
+                        "storage-mode dashboards",
+                    ],
+                    context={"action": "storage-guard", "url_path": url_path},
+                )
+            )
+
+    def _resolve_view(self, config: dict[str, Any], view: str) -> dict[str, Any]:
+        """Resolve a view specifier (numeric index, ``path``, or ``title``).
+
+        ``view`` may be a numeric index (in string or int form), a view
+        ``path``, or a view ``title``. Raises a clear ``ToolError`` when no
+        view matches.
+        """
+        views = config.get("views", [])
+        if not isinstance(views, list):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    "Dashboard config has no 'views' list",
+                    context={"view": view},
+                )
+            )
+        if isinstance(view, int) or (
+            isinstance(view, str) and view.isdigit() and len(views) > 0
+        ):
+            index = int(view)
+            if 0 <= index < len(views):
+                return cast(dict[str, Any], views[index])
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    f"View index {index} out of range",
+                    context={"view": view, "view_count": len(views)},
+                )
+            )
+        for candidate in views:
+            if isinstance(candidate, dict) and (
+                candidate.get("path") == view or candidate.get("title") == view
+            ):
+                return candidate
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                f"View '{view}' not found",
+                suggestions=[
+                    "Pass a view index, path, or title",
+                    "Use ha_config_get_dashboard() to list the dashboard's views",
+                ],
+                context={"view": view},
+            )
+        )
+
+    def _resolve_section(self, view: dict[str, Any], section: int) -> dict[str, Any]:
+        """Resolve a sections-view section by index.
+
+        Raises a clear ``ToolError`` when the view is not a sections view (no
+        ``sections`` key) or the index is out of range.
+        """
+        sections = view.get("sections")
+        if not isinstance(sections, list):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "View is not a sections view (no 'sections' key)",
+                    suggestions=[
+                        "Pass a 'sections'-type view, or omit the section "
+                        "param for flat-layout views",
+                    ],
+                    context={
+                        "view": view.get("path") or view.get("title") or "<unnamed>"
+                    },
+                )
+            )
+        if not 0 <= section < len(sections):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    f"Section index {section} out of range",
+                    context={
+                        "view": view.get("path") or view.get("title"),
+                        "section": section,
+                        "section_count": len(sections),
+                    },
+                )
+            )
+        return cast(dict[str, Any], sections[section])
 
     @tool(
         name="ha_config_get_dashboard",
