@@ -4434,6 +4434,141 @@ class DashboardConfigTools:
             ],
         }
 
+    @tool(
+        name="ha_config_set_view",
+        tags={"Dashboards"},
+        annotations={
+            "readOnlyHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "title": "Create or Update Dashboard View",
+        },
+    )
+    @with_auto_backup(domain="dashboard", id_param="url_path", skip_fn=_skip_dry_run)
+    @log_tool_usage
+    async def ha_config_set_view(
+        self,
+        url_path: Annotated[
+            str,
+            Field(description="Dashboard URL path (e.g., 'my-dashboard')."),
+        ],
+        view_config: Annotated[
+            dict[str, Any],
+            JSON_STRING_COERCION,
+            Field(
+                description="View config dict (e.g., {'title': 'Garage', "
+                "'path': 'garage'}). For new views, this is the full config. "
+                "For existing views, fields are shallow-merged (cards are "
+                "preserved unless ``view_config`` includes a ``cards`` key)."
+            ),
+        ],
+        view: Annotated[
+            str | None,
+            Field(
+                description="Target view to merge into: a numeric index (as "
+                "string), or a matching view path or title. Omit (None) to "
+                "add a new view."
+            ),
+        ] = None,
+        position: Annotated[
+            int | None,
+            Field(
+                description="Insert position for a new view (defaults to "
+                "append at the end of the views list). Ignored when updating "
+                "an existing view."
+            ),
+        ] = None,
+        dry_run: Annotated[
+            bool,
+            Field(
+                description="If true, preview the would-be change WITHOUT "
+                'saving: returns {"dry_run": true, "url_path", "summary", '
+                '"config"}. Performs ZERO writes and creates no backup snapshot.'
+            ),
+        ] = False,
+    ) -> dict[str, Any]:
+        """Create a new dashboard view or update an existing one."""
+        config, _ = await _get_dashboard_config_internal(self._client, url_path)
+        await self._assert_storage_mode_dashboard(url_path)
+
+        if view is None:
+            views = config.setdefault("views", [])
+            if not isinstance(views, list):
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.RESOURCE_NOT_FOUND,
+                        "Dashboard config has no 'views' list",
+                        context={"action": "set_view", "url_path": url_path},
+                    )
+                )
+            insert_at = position if position is not None else len(views)
+            insert_at = min(insert_at, len(views))
+            views.insert(insert_at, view_config)
+            summary = f"Added new view at index {insert_at}"
+        else:
+            target = self._resolve_view(config, view)
+            target.update(view_config)
+            summary = f"Updated view '{view}'"
+
+        if dry_run:
+            return self._build_dry_run_result(url_path, summary, config)
+
+        await self._save_dashboard_config(url_path, config)
+        return {"success": True, "url_path": url_path, "summary": summary}
+
+    @tool(
+        name="ha_config_remove_view",
+        tags={"Dashboards"},
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+            "title": "Remove Dashboard View",
+        },
+    )
+    @with_auto_backup(domain="dashboard", id_param="url_path", skip_fn=_skip_dry_run)
+    @log_tool_usage
+    async def ha_config_remove_view(
+        self,
+        url_path: Annotated[
+            str,
+            Field(description="Dashboard URL path (e.g., 'my-dashboard')."),
+        ],
+        view: Annotated[
+            str,
+            Field(
+                description="Target view to remove: a numeric index (as "
+                "string), or a matching view path or title."
+            ),
+        ],
+        dry_run: Annotated[
+            bool,
+            Field(
+                description="If true, preview the would-be removal WITHOUT "
+                'saving: returns {"dry_run": true, "url_path", "summary", '
+                '"config"}. Performs ZERO writes and creates no backup snapshot.'
+            ),
+        ] = False,
+    ) -> dict[str, Any]:
+        """Remove a dashboard view and all cards within it."""
+        config, _ = await _get_dashboard_config_internal(self._client, url_path)
+        await self._assert_storage_mode_dashboard(url_path)
+
+        target = self._resolve_view(config, view)
+        views = config.get("views", [])
+        idx = views.index(target)
+        removed = views.pop(idx)
+        card_count = len(removed.get("cards", [])) if isinstance(removed, dict) else 0
+        summary = f"Removed view at index {idx} and all {card_count} cards within it"
+
+        if dry_run:
+            return self._build_dry_run_result(url_path, summary, config)
+
+        await self._save_dashboard_config(url_path, config)
+        return {"success": True, "url_path": url_path, "summary": summary}
+
 
 # =========================================================================
 # Dashboard Resource Management Tools
