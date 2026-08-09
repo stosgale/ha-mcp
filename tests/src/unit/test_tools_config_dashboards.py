@@ -350,3 +350,252 @@ class TestDeleteDashboardNotFoundShape:
         # leak the dropped resource_type / identifier keys.
         assert "resource_type" not in result
         assert "identifier" not in result
+
+
+# -----------------------------------------------------------------------------
+# ha_config_set_dashboard — dry_run previews (ZERO writes)
+# -----------------------------------------------------------------------------
+
+
+def _storage_rows(*rows: dict) -> list[dict]:
+    """Default-storage dashboard rows; callers override per test."""
+    if rows:
+        return list(rows)
+    return [{"id": "my_dash", "url_path": "my-dash", "mode": "storage"}]
+
+
+def _route_dashboard_ws(
+    client: MagicMock, config: dict, dashboards: list[dict] | None = None
+) -> None:
+    """Route WS replies by message ``type`` for the set/delete flows.
+
+    ``config`` is the dict ``lovelace/config`` serves (mutated in place by
+    the tools); ``dashboards`` is the ``lovelace/dashboards/list`` payload.
+    """
+    if dashboards is None:
+        dashboards = _storage_rows()
+
+    async def router(data: dict) -> dict:
+        msg_type = data.get("type")
+        if msg_type == "lovelace/config":
+            return {"success": True, "result": config}
+        if msg_type == "lovelace/dashboards/list":
+            return {"success": True, "result": dashboards}
+        if msg_type == "lovelace/dashboards/create":
+            return {"success": True, "result": {"id": "dash_new"}}
+        if msg_type == "lovelace/dashboards/update":
+            return {"success": True}
+        if msg_type in ("lovelace/config/save", "lovelace/dashboards/delete"):
+            return {"success": True}
+        raise AssertionError(f"Unexpected WS message type: {msg_type}")
+
+    client.send_websocket_message.side_effect = router
+
+
+def _ws_types(client: MagicMock) -> list[str]:
+    """The ``type`` of every WS message the tool sent, in order."""
+    return [
+        call.args[0].get("type")
+        for call in client.send_websocket_message.call_args_list
+    ]
+
+
+class TestSetDashboardDryRun:
+    """dry_run must produce ZERO writes: no ``lovelace/config/save`` on an
+    existing dashboard, no ``lovelace/dashboards/create`` on a missing one —
+    the preview is built purely from the list read."""
+
+    async def test_existing_dashboard_previews_without_save(self, fake_client):
+        config = {"views": [{"title": "Home", "cards": []}]}
+        _route_dashboard_ws(fake_client, config)
+        tools = DashboardConfigTools(fake_client)
+
+        result = await tools.ha_config_set_dashboard(
+            url_path="my-dash", config={"views": []}, dry_run=True
+        )
+
+        assert result["dry_run"] is True
+        assert result["url_path"] == "my-dash"
+        assert result["summary"] == "Would replace config for dashboard 'my-dash'"
+        assert result["config"] == {"views": []}
+        assert "lovelace/config/save" not in _ws_types(fake_client)
+        assert fake_client.send_websocket_message.call_count == 1
+
+    async def test_new_dashboard_previews_create_without_create_call(self, fake_client):
+        _route_dashboard_ws(fake_client, config={"views": []})
+        tools = DashboardConfigTools(fake_client)
+
+        result = await tools.ha_config_set_dashboard(
+            url_path="new-dash", config={"views": [{"title": "New"}]}, dry_run=True
+        )
+
+        assert result["dry_run"] is True
+        assert result["summary"] == "Would create dashboard 'new-dash' with config"
+        assert result["config"] == {"views": [{"title": "New"}]}
+        assert "lovelace/dashboards/create" not in _ws_types(fake_client)
+        assert fake_client.send_websocket_message.call_count == 1
+
+
+class TestSetDashboardConfigHash:
+    """config_hash is mandatory ONLY on the replace path; creating a new
+    dashboard must succeed without it."""
+
+    async def test_replace_without_config_hash_raises(self, fake_client):
+        config = {"views": [{"title": "Home", "cards": []}]}
+        _route_dashboard_ws(fake_client, config)
+        tools = DashboardConfigTools(fake_client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.ha_config_set_dashboard(
+                url_path="my-dash", config={"views": []}
+            )
+
+        body = json.loads(str(exc_info.value))
+        assert (
+            "config_hash is required when replacing an existing"
+            in body["error"]["message"]
+        )
+        assert "lovelace/config/save" not in _ws_types(fake_client)
+
+    async def test_create_without_config_hash_succeeds(self, fake_client):
+        # Only an unrelated dashboard exists; "new-dash" is a create.
+        _route_dashboard_ws(
+            fake_client,
+            config={"views": []},
+            dashboards=_storage_rows(
+                {"id": "other", "url_path": "other-dash", "mode": "storage"}
+            ),
+        )
+        tools = DashboardConfigTools(fake_client)
+
+        result = await tools.ha_config_set_dashboard(
+            url_path="new-dash", config={"views": [{"title": "New"}]}
+        )
+
+        assert result["success"] is True
+        assert result["action"] == "create"
+        assert result["dashboard_created"] is True
+        assert result["config_updated"] is True
+        types = _ws_types(fake_client)
+        assert "lovelace/dashboards/create" in types
+        assert "lovelace/config/save" in types
+
+
+# -----------------------------------------------------------------------------
+# ha_config_delete_dashboard — confirm gate
+# -----------------------------------------------------------------------------
+
+
+class TestDeleteDashboardConfirm:
+    async def test_without_confirm_raises(self, fake_client):
+        tools = DashboardConfigTools(fake_client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.ha_config_delete_dashboard(url_path="my-dash", confirm=False)
+
+        body = json.loads(str(exc_info.value))
+        assert (
+            "confirm=True is required to delete a dashboard" in body["error"]["message"]
+        )
+        # The refusal happens before any WS round-trip.
+        assert fake_client.send_websocket_message.call_count == 0
+
+    async def test_confirm_omitted_raises(self, fake_client):
+        tools = DashboardConfigTools(fake_client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.ha_config_delete_dashboard(url_path="my-dash")
+
+        body = json.loads(str(exc_info.value))
+        assert (
+            "confirm=True is required to delete a dashboard" in body["error"]["message"]
+        )
+        assert fake_client.send_websocket_message.call_count == 0
+
+    async def test_dry_run_previews_without_delete_call(self, fake_client):
+        _route_dashboard_ws(fake_client, config={"views": []})
+        tools = DashboardConfigTools(fake_client)
+
+        result = await tools.ha_config_delete_dashboard(
+            url_path="my-dash", confirm=True, dry_run=True
+        )
+
+        assert result["dry_run"] is True
+        assert result["url_path"] == "my-dash"
+        assert result["summary"] == "Would delete dashboard 'my-dash'"
+        assert "lovelace/dashboards/delete" not in _ws_types(fake_client)
+        assert fake_client.send_websocket_message.call_count == 1
+
+    async def test_confirm_true_deletes(self, fake_client):
+        _route_dashboard_ws(fake_client, config={"views": []})
+        tools = DashboardConfigTools(fake_client)
+
+        result = await tools.ha_config_delete_dashboard(
+            url_path="my-dash", confirm=True
+        )
+
+        assert result["success"] is True
+        assert result["action"] == "delete"
+        assert result["message"] == "Dashboard deleted successfully"
+        assert _ws_types(fake_client) == [
+            "lovelace/dashboards/list",
+            "lovelace/dashboards/delete",
+        ]
+
+
+# -----------------------------------------------------------------------------
+# Storage-mode guard on the card/view write tools
+# -----------------------------------------------------------------------------
+
+
+class TestStorageModeGuard:
+    @pytest.fixture
+    def set_card(self, fake_client):
+        return DashboardConfigTools(fake_client).ha_config_set_card
+
+    async def test_yaml_mode_dashboard_blocked(self, fake_client, set_card):
+        _route_dashboard_ws(
+            fake_client,
+            config={"views": [{"title": "Yaml", "cards": []}]},
+            dashboards=_storage_rows(
+                {"id": "yaml_dash", "url_path": "yaml-dash", "mode": "yaml"}
+            ),
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await set_card(
+                url_path="yaml-dash",
+                view="0",
+                card={"type": "markdown", "content": "x"},
+            )
+
+        body = json.loads(str(exc_info.value))
+        assert "only storage-mode dashboards are supported" in body["error"]["message"]
+        assert "lovelace/config/save" not in _ws_types(fake_client)
+
+    async def test_default_dashboard_writable(self, fake_client, set_card):
+        # The default dashboard is never listed; the guard re-reads its config
+        # instead of consulting the dashboards list.
+        config = {"views": [{"title": "Home", "cards": []}]}
+        _route_dashboard_ws(fake_client, config)
+        new_card = {"type": "markdown", "content": "new"}
+
+        result = await set_card(url_path="lovelace", view="0", card=new_card)
+
+        assert result["success"] is True
+        types = _ws_types(fake_client)
+        assert types.count("lovelace/config") == 2  # fetch + guard re-read
+        assert "lovelace/config/save" in types
+        assert "lovelace/dashboards/list" not in types
+
+    async def test_storage_mode_dashboard_writable(self, fake_client, set_card):
+        config = {"views": [{"title": "Home", "cards": []}]}
+        _route_dashboard_ws(fake_client, config)
+        new_card = {"type": "markdown", "content": "new"}
+
+        result = await set_card(url_path="my-dash", view="0", card=new_card)
+
+        assert result["success"] is True
+        types = _ws_types(fake_client)
+        assert "lovelace/dashboards/list" in types
+        assert "lovelace/config/save" in types
