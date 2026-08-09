@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from ha_mcp import config
 from ha_mcp.dashboard_screenshot.provision import EngineTarget
+from ha_mcp.utils.config_hash import compute_config_hash
 
 _PNG = b"\x89PNG\r\n\x1a\nunit"
 _JPEG = b"\xff\xd8\xffunit"
@@ -2210,7 +2211,24 @@ class TestPublicScreenshotOptionForwarding:
         client = MagicMock()
         client.send_websocket_message = AsyncMock(
             side_effect=[
-                {"result": [{"url_path": "wall-panel", "id": "wall_panel"}]},
+                {
+                    "result": [
+                        {
+                            "url_path": "wall-panel",
+                            "id": "wall_panel",
+                            "mode": "storage",
+                        }
+                    ]
+                },
+                {
+                    "result": [
+                        {
+                            "url_path": "wall-panel",
+                            "id": "wall_panel",
+                            "mode": "storage",
+                        }
+                    ]
+                },
                 {"result": dashboard_config},
                 {"success": True},
                 {"result": dashboard_config},
@@ -2222,6 +2240,7 @@ class TestPublicScreenshotOptionForwarding:
         ).ha_config_set_dashboard(
             url_path="wall-panel",
             config=dashboard_config,
+            config_hash=compute_config_hash(dashboard_config),
             return_screenshot=True,
             MandatoryBPS=False,
             view_path="home",

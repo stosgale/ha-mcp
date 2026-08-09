@@ -7,6 +7,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 
 from ha_mcp.tools.tools_config_dashboards import DashboardConfigTools
+from ha_mcp.utils.config_hash import compute_config_hash
 
 
 class TestSetDashboardMetadataUpdate:
@@ -24,7 +25,9 @@ class TestSetDashboardMetadataUpdate:
 
     def _make_dashboard_list(self, url_path: str, dashboard_id: str = "dash-1"):
         """Helper: mock existing dashboards list response."""
-        return {"result": [{"url_path": url_path, "id": dashboard_id}]}
+        return {
+            "result": [{"url_path": url_path, "id": dashboard_id, "mode": "storage"}]
+        }
 
     @pytest.mark.asyncio
     async def test_metadata_updated_true_when_title_provided_for_existing(
@@ -172,14 +175,20 @@ class TestSetDashboardMetadataUpdate:
     ):
         submitted = {"views": [{"title": "Home", "path": "submitted"}]}
         authoritative = {"views": [{"title": "Home", "path": "normalized"}]}
+        pre_read_config = {"views": []}
         mock_client.send_websocket_message.side_effect = [
-            self._make_dashboard_list("my-dashboard"),
-            {"result": {"views": []}},  # pre-write conflict/size read
+            self._make_dashboard_list("my-dashboard"),  # existence check
+            self._make_dashboard_list("my-dashboard"),  # storage-mode guard
+            {"result": pre_read_config},  # pre-write conflict/size read
             {"success": True},  # lovelace/config/save
             {"result": authoritative},  # authoritative post-write readback
         ]
 
-        result = await set_tool(url_path="my-dashboard", config=submitted)
+        result = await set_tool(
+            url_path="my-dashboard",
+            config=submitted,
+            config_hash=compute_config_hash(pre_read_config),
+        )
 
         assert result["success"] is True
         assert result["render_paths"][0]["view_path"] == "normalized"
@@ -187,9 +196,9 @@ class TestSetDashboardMetadataUpdate:
         requests = [
             call.args[0] for call in mock_client.send_websocket_message.call_args_list
         ]
-        assert requests[2]["type"] == "lovelace/config/save"
-        assert requests[2]["config"] == submitted
-        assert requests[3] == {
+        assert requests[3]["type"] == "lovelace/config/save"
+        assert requests[3]["config"] == submitted
+        assert requests[4] == {
             "type": "lovelace/config",
             "force": True,
             "url_path": "my-dashboard",

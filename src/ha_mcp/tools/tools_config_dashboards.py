@@ -2835,7 +2835,7 @@ class DashboardConfigTools:
             "title": "Create or Update Dashboard",
         },
     )
-    @with_auto_backup(domain="dashboard", id_param="url_path")
+    @with_auto_backup(domain="dashboard", id_param="url_path", skip_fn=_skip_dry_run)
     @log_tool_usage
     async def ha_config_set_dashboard(
         self,
@@ -2874,8 +2874,9 @@ class DashboardConfigTools:
             str | None,
             Field(
                 description="Config hash from ha_config_get_dashboard for optimistic locking. "
-                "REQUIRED for python_transform (validates dashboard unchanged). "
-                "Optional for config (validates before full replacement if provided)."
+                "REQUIRED when replacing an existing dashboard's config "
+                "(validates the dashboard is unchanged since your read). "
+                "Required for python_transform. Not needed when creating a new dashboard."
             ),
         ] = None,
         title: Annotated[
@@ -2903,6 +2904,16 @@ class DashboardConfigTools:
                 "For existing dashboards, only updated when explicitly provided."
             ),
         ] = None,
+        dry_run: Annotated[
+            bool,
+            Field(
+                description="If true, preview the would-be write WITHOUT saving "
+                'anything: returns {"dry_run": true, "url_path", "summary", '
+                '"config"} describing the create/update that would happen. '
+                "For a nonexistent url_path, previews a dashboard create "
+                "without creating the dashboard metadata."
+            ),
+        ] = False,
         MandatoryBPS: Annotated[
             bool,
             Field(default=True),
@@ -3020,6 +3031,15 @@ class DashboardConfigTools:
         Note: Strategy dashboards cannot be converted to custom dashboards via this tool.
         Use the "Take Control" feature in the Home Assistant interface to convert them.
 
+        DRY-RUN PREVIEW:
+        Pass dry_run=True to preview the would-be write WITHOUT saving anything.
+        Returns {\"dry_run\": true, \"url_path\", \"summary\", \"config\"}: the
+        summary names the create/update that would happen and config is the
+        config that would be written. For a nonexistent url_path, the preview
+        describes a dashboard create WITHOUT creating the dashboard metadata
+        (no lovelace/dashboards/create call) — a safe way to check a config
+        will be accepted before committing.
+
         Update existing dashboard config:
         ha_config_set_dashboard(
             url_path="existing-dashboard",
@@ -3036,10 +3056,15 @@ class DashboardConfigTools:
 
         Note: When updating an existing dashboard, title/icon/require_admin/show_in_sidebar
         are also updated if explicitly provided alongside (or instead of) a config change.
+        Replacing an existing dashboard's config REQUIRES the config_hash returned by
+        ha_config_get_dashboard() (optimistic locking); it is not needed when creating
+        a new dashboard.
 
         STORAGE-MODE vs YAML-MODE DASHBOARDS:
         This tool only manages storage-mode dashboards (created via UI/API and stored in
         Home Assistant's storage backend). It does NOT touch YAML-defined dashboards.
+        Before overwriting an existing dashboard's config, the tool verifies the
+        dashboard is storage-mode and raises a clear error for YAML-mode dashboards.
         Two distinct YAML cases exist and this tool covers neither:
         - "YAML-mode" dashboards: written in their own .yaml file referenced from
           configuration.yaml under ``lovelace: dashboards:``. The dashboard itself lives
@@ -3095,6 +3120,7 @@ class DashboardConfigTools:
                     MandatoryBPS,
                     return_screenshot=return_screenshot,
                     screenshot_options=screenshot_options,
+                    dry_run=dry_run,
                 )
 
             return await self._run_dashboard_config_update(
@@ -3110,6 +3136,7 @@ class DashboardConfigTools:
                 return_screenshot=return_screenshot,
                 screenshot_options=screenshot_options,
                 MandatoryBPS=MandatoryBPS,
+                dry_run=dry_run,
             )
 
         except ToolError as te:
@@ -3356,6 +3383,7 @@ class DashboardConfigTools:
         *,
         return_screenshot: bool,
         screenshot_options: _DashboardScreenshotOptions,
+        dry_run: bool = False,
     ) -> "dict[str, Any] | ToolResult":
         """Execute python_transform mode and return the tool response."""
         if config_hash is None:
@@ -3377,6 +3405,12 @@ class DashboardConfigTools:
         transformed_config = self._apply_dashboard_python_transform(
             url_path, python_transform, current_config
         )
+        if dry_run:
+            return self._build_dry_run_result(
+                url_path,
+                f"Would transform config for dashboard '{url_path}'",
+                transformed_config,
+            )
         (
             post_save_config,
             new_config_hash,
@@ -3581,35 +3615,31 @@ class DashboardConfigTools:
         return dashboard_exists, dashboard_id, metadata_updated, hint
 
     async def _check_dashboard_replace_hash(
-        self, url_path: str, config_hash: str | None
+        self, url_path: str, config_hash: str
     ) -> str | None:
-        """Optionally validate config_hash and warn on large full-config replacement.
+        """Validate ``config_hash`` and warn on large full-config replacement.
 
-        Tolerates fetch failures — full replacement still proceeds even if the
-        pre-read can't load the current state (force-replace path).
+        ``config_hash`` is mandatory on the replace path (enforced by
+        ``_apply_dashboard_config``), so the optimistic-lock check always runs.
+        A failed pre-read RAISES — there is no force-replace path: if the
+        current config cannot be read, the replacement must not proceed.
         """
-        try:
-            existing_config, existing_hash = await _get_dashboard_config_internal(
-                self._client, url_path
-            )
-        except ToolError:
-            # Pre-read failure is non-fatal on the force-replace path: skip
-            # the optimistic-lock check and large-config warning and proceed
-            # with the replacement.
-            return None
+        existing_config, existing_hash = await _get_dashboard_config_internal(
+            self._client, url_path
+        )
 
         if not isinstance(existing_config, dict):
             return None
 
         existing_config_size = len(json.dumps(existing_config))
-        if config_hash is not None and existing_hash != config_hash:
+        if existing_hash != config_hash:
             raise_tool_error(
                 create_error_response(
                     ErrorCode.SERVICE_CALL_FAILED,
                     "Dashboard modified since last read (conflict)",
                     suggestions=[
                         "Call ha_config_get_dashboard() again",
-                        "Use the fresh config_hash, or omit config_hash to force replace",
+                        "Use the fresh config_hash from that response",
                     ],
                     context={"action": "set", "url_path": url_path},
                 )
@@ -3678,6 +3708,23 @@ class DashboardConfigTools:
 
         hint: str | None = None
         if dashboard_exists:
+            # Fail-closed storage-mode guard BEFORE the config save: never
+            # overwrite a YAML-mode dashboard's config body.
+            await self._assert_storage_mode_dashboard(url_path)
+            # config_hash is mandatory on the replace path (optimistic locking).
+            if config_hash is None:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        "config_hash is required when replacing an existing "
+                        "dashboard's config",
+                        suggestions=[
+                            "Call ha_config_get_dashboard() first",
+                            "Use the config_hash from that response",
+                        ],
+                        context={"action": "set", "url_path": url_path},
+                    )
+                )
             hint = await self._check_dashboard_replace_hash(url_path, config_hash)
 
         await self._save_dashboard_config(url_path, config_dict)
@@ -3689,6 +3736,7 @@ class DashboardConfigTools:
         config: dict[str, Any] | str | None,
         config_hash: str | None,
         *,
+        dry_run: bool = False,
         title: str | None,
         icon: str | None,
         require_admin: bool | None,
@@ -3700,6 +3748,16 @@ class DashboardConfigTools:
         MandatoryBPS: bool,
     ) -> "dict[str, Any] | ToolResult":
         """Execute config-replacement mode (create-or-update) and return the tool response."""
+        if dry_run:
+            return await self._preview_dashboard_config_update(
+                url_path,
+                config,
+                title=title,
+                icon=icon,
+                require_admin=require_admin,
+                show_in_sidebar=show_in_sidebar,
+                pre_fetched_dashboards=pre_fetched_dashboards,
+            )
         (
             dashboard_exists,
             dashboard_id,
@@ -3759,6 +3817,46 @@ class DashboardConfigTools:
             config=render_config,
             options=screenshot_options,
         )
+
+    async def _preview_dashboard_config_update(
+        self,
+        url_path: str,
+        config: dict[str, Any] | str | None,
+        *,
+        title: str | None,
+        icon: str | None,
+        require_admin: bool | None,
+        show_in_sidebar: bool | None,
+        pre_fetched_dashboards: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Build a dry-run preview for config-replacement mode (ZERO writes).
+
+        Short-circuits BEFORE ``_ensure_dashboard_exists`` /
+        ``_create_dashboard``: a dashboard missing from the registry is
+        previewed as a create — no ``lovelace/dashboards/create`` metadata
+        call — and an existing one as a config/metadata update. Nothing is
+        saved and no backup snapshot is taken (``_skip_dry_run`` on the
+        ``@with_auto_backup`` decorator).
+        """
+        dashboard_exists, _ = await self._lookup_existing_dashboards(
+            url_path, pre_fetched_dashboards
+        )
+        preview_config: dict[str, Any] = {}
+        if config is not None:
+            parsed_config = parse_json_param(config, "config")
+            if isinstance(parsed_config, dict):
+                preview_config = cast(dict[str, Any], parsed_config)
+        if not dashboard_exists:
+            summary = (
+                f"Would create dashboard '{url_path}' with config"
+                if config is not None
+                else f"Would create dashboard '{url_path}'"
+            )
+        elif config is not None:
+            summary = f"Would replace config for dashboard '{url_path}'"
+        else:
+            summary = f"Would update metadata for dashboard '{url_path}'"
+        return self._build_dry_run_result(url_path, summary, preview_config)
 
     @tool(
         name="ha_config_delete_dashboard",
