@@ -4074,6 +4074,211 @@ class DashboardConfigTools:
             )
         return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
 
+    @tool(
+        name="ha_config_set_card",
+        tags={"Dashboards"},
+        annotations={
+            "readOnlyHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "title": "Upsert Dashboard Card",
+        },
+    )
+    @with_auto_backup(domain="dashboard", id_param="url_path", skip_fn=_skip_dry_run)
+    @log_tool_usage
+    async def ha_config_set_card(
+        self,
+        url_path: Annotated[
+            str,
+            Field(description="Dashboard URL path (e.g., 'my-dashboard')."),
+        ],
+        view: Annotated[
+            str,
+            Field(
+                description="Target view: a numeric index (as string), or a "
+                "matching view path or title."
+            ),
+        ],
+        section: Annotated[
+            int | None,
+            Field(
+                description="Section index within a 'sections'-type view. "
+                "Required when the target view is a sections view; omit for "
+                "flat-layout views."
+            ),
+        ] = None,
+        card_index: Annotated[
+            int | None,
+            Field(
+                description="Index of an existing card to replace or move. "
+                "Omit (None) to insert a new card."
+            ),
+        ] = None,
+        card: Annotated[
+            dict[str, Any] | None,
+            JSON_STRING_COERCION,
+            Field(
+                description="Card config dict (must include a ``type`` key). "
+                "Required for insert and replace; ignored for move."
+            ),
+        ] = None,
+        position: Annotated[
+            int | None,
+            Field(
+                description="Destination index for insert or move. Defaults to "
+                "append (end of the card list)."
+            ),
+        ] = None,
+        dry_run: Annotated[
+            bool,
+            Field(
+                description="If true, preview the would-be change WITHOUT "
+                'saving: returns {"dry_run": true, "url_path", "summary", '
+                '"config"}. Performs ZERO writes and creates no backup snapshot.'
+            ),
+        ] = False,
+        config_hash: Annotated[
+            str | None,
+            Field(
+                description="Config hash from ha_config_get_dashboard for "
+                "optimistic locking (optional). Validates the dashboard is "
+                "unchanged since your read; a mismatch refuses the write."
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Insert, replace, or move a card within a dashboard view."""
+        config, _ = await _get_dashboard_config_internal(self._client, url_path)
+        await self._assert_storage_mode_dashboard(url_path)
+
+        target_view = self._resolve_view(config, view)
+        if section is not None:
+            target_section = self._resolve_section(target_view, section)
+            cards = target_section.setdefault("cards", [])
+        else:
+            cards = target_view.setdefault("cards", [])
+        if not isinstance(cards, list):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "Card container is not a list",
+                    suggestions=[
+                        "Pass a view or section whose 'cards' value is a list",
+                        "Use ha_config_get_dashboard() to inspect the config",
+                    ],
+                    context={"action": "set_card", "url_path": url_path},
+                )
+            )
+
+        summary = self._apply_card_mutation(
+            cards,
+            card_index=card_index,
+            card=card,
+            position=position,
+            url_path=url_path,
+        )
+
+        if dry_run:
+            return self._build_dry_run_result(url_path, summary, config)
+
+        if config_hash is not None:
+            _current_config, current_hash = await _get_dashboard_config_internal(
+                self._client, url_path
+            )
+            if current_hash != config_hash:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        "Dashboard modified since last read (conflict)",
+                        suggestions=[
+                            "Call ha_config_get_dashboard() again",
+                            "Use the fresh config_hash from that response",
+                        ],
+                        context={"action": "set_card", "url_path": url_path},
+                    )
+                )
+
+        await self._save_dashboard_config(url_path, config)
+        return {"success": True, "url_path": url_path, "summary": summary}
+
+    def _apply_card_mutation(
+        self,
+        cards: list[Any],
+        *,
+        card_index: int | None,
+        card: dict[str, Any] | None,
+        position: int | None,
+        url_path: str,
+    ) -> str:
+        """Apply the insert/replace/move card mutation, returning a summary.
+
+        ``cards`` is the resolved card list (a view's ``cards`` or a section's
+        ``cards``) mutated in place. Raises a structured ``ToolError`` on
+        out-of-range indices and missing ``card`` values.
+        """
+        if card_index is not None and position is not None:
+            if not 0 <= card_index < len(cards):
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.RESOURCE_NOT_FOUND,
+                        f"Card index {card_index} out of range",
+                        context={
+                            "action": "move",
+                            "url_path": url_path,
+                            "card_index": card_index,
+                            "card_count": len(cards),
+                        },
+                    )
+                )
+            moved = cards.pop(card_index)
+            insert_at = min(position, len(cards))
+            cards.insert(insert_at, moved)
+            return f"Moved card from index {card_index} to {insert_at}"
+        if card_index is not None:
+            if card is None:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        "card is required for replace",
+                        suggestions=[
+                            "Pass the replacement card config dict",
+                            "Omit card_index to insert a new card instead",
+                        ],
+                        context={"action": "replace", "url_path": url_path},
+                    )
+                )
+            if not 0 <= card_index < len(cards):
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.RESOURCE_NOT_FOUND,
+                        f"Card index {card_index} out of range",
+                        context={
+                            "action": "replace",
+                            "url_path": url_path,
+                            "card_index": card_index,
+                            "card_count": len(cards),
+                        },
+                    )
+                )
+            cards[card_index] = card
+            return f"Replaced card at index {card_index}"
+        if card is None:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "card is required for insert",
+                    suggestions=[
+                        "Pass the card config dict to insert",
+                        "Pass card_index to replace an existing card instead",
+                    ],
+                    context={"action": "insert", "url_path": url_path},
+                )
+            )
+        insert_at = position if position is not None else len(cards)
+        insert_at = min(insert_at, len(cards))
+        cards.insert(insert_at, card)
+        return f"Inserted new card at index {insert_at}"
+
 
 # =========================================================================
 # Dashboard Resource Management Tools
